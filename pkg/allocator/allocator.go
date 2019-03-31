@@ -18,14 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
-	"strconv"
 	"time"
 
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/idpool"
 	"github.com/cilium/cilium/pkg/kvstore"
-	kvstoreallocator "github.com/cilium/cilium/pkg/kvstore/allocator"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -117,7 +114,7 @@ type Allocator struct {
 	events AllocatorEventChan
 
 	// keyType is an instance of the type to be used as allocator key.
-	keyType kvstoreallocator.AllocatorKey
+	keyType AllocatorKey
 
 	// min is the lower limit when allocating IDs. The allocator will never
 	// allocate an ID lesser than this value.
@@ -176,19 +173,84 @@ type Allocator struct {
 
 	// backend is the upstream, shared, backend to which we syncronize local
 	// information
-	backend *kvstoreallocator.KVStoreBackend
+	backend Backend
 }
 
 // AllocatorOption is the base type for allocator options
 type AllocatorOption func(*Allocator)
 
 // NewAllocatorForGC returns an allocator that can be used to run RunGC()
-func NewAllocatorForGC(backend *kvstoreallocator.KVStoreBackend) *Allocator {
+func NewAllocatorForGC(backend Backend) *Allocator {
 	return &Allocator{backend: backend}
 }
 
+// Backend represents clients to remote ID allocation systems, such as KV
+// Stores. These are used to coordinate key->ID allocation between cilium
+// nodes.
+type Backend interface {
+	// DeleteAllKeys will delete all keys. It is used in tests.
+	DeleteAllKeys()
+
+	// AllocateID creates a new key->ID association. This is expected to be a
+	// create-only operation, and the ID may be allocated by another node. An
+	// error in that case is not expected to be fatal. The actual ID is obtained
+	// by Allocator from the local idPool, which is updated with used-IDs as the
+	// Backend makes calls to the handler in ListAndWatch.
+	AllocateID(ctx context.Context, id idpool.ID, key AllocatorKey) error
+
+	// AcquireReference records that this node is using this key->ID mapping.
+	// This is distinct from any reference counting within this agent; only one
+	// reference exists for this node for any number of managed endpoints using
+	// it.
+	// The semantics of cleaning up stale references is delegated to the Backend
+	// implementation. RunGC may need to be invoked.
+	// This can race, and so lock can be provided (via a Lock call, below).
+	AcquireReference(ctx context.Context, id idpool.ID, key AllocatorKey, lock kvstore.KVLocker) error
+
+	// Release releases the use of an ID associated with the provided key. It
+	// does not guard against concurrent calls to
+	// releases.Release(ctx context.Context, key AllocatorKey) (err error)
+	Release(ctx context.Context, key AllocatorKey) (err error)
+
+	// UpdateKey refreshes the record that this node is using this key -> id
+	// mapping. When reliablyMissing is set it will also recreate missing master or
+	// slave keys.
+	UpdateKey(ctx context.Context, id idpool.ID, key AllocatorKey, reliablyMissing bool) error
+
+	// Get returns the allocated ID for this key as seen by the Backend. This may
+	// have been created by other agents.
+	Get(ctx context.Context, key AllocatorKey) (idpool.ID, error)
+
+	// GetIfLocked behaves like Get, but returns an error when the key value has
+	// changed since lock was created with Lock.
+	GetIfLocked(ctx context.Context, key AllocatorKey, lock kvstore.KVLocker) (idpool.ID, error)
+
+	// GetByID returns the key associated with this ID, as seen by the Backend.
+	// This may have been created by other agents.
+	GetByID(id idpool.ID) (AllocatorKey, error)
+
+	// Lock provides an opaque lock object that can be used, later, to ensure
+	// that the key has not changed since the lock was created. This can be done
+	// with GetIfLocked.
+	Lock(ctx context.Context, key AllocatorKey) (kvstore.KVLocker, error)
+
+	// ListAndWatch begins synchronizing the local Backend instance with its
+	// remote.
+	ListAndWatch(handler CacheMutations, stopChan chan struct{})
+
+	// RunGC reaps stale or unused identities within the Backend and makes them
+	// available for reuse. It is used by the cilium-operator and is not invoked
+	// by cilium-agent.
+	// Note: not all Backend implemenations rely on this, such as the kvstore
+	// backends, and may use leases to expire keys.
+	RunGC(staleKeysPrevRound map[string]uint64) (map[string]uint64, error)
+
+	// Status returns a human-readable status of the Backend.
+	Status() (string, error)
+}
+
 // NewAllocator creates a new Allocator. Any type can be used as key as long as
-// the type implements the kvstoreallocator.AllocatorKey interface. A variable of the type has
+// the type implements the AllocatorKey interface. A variable of the type has
 // to be passed into NewAllocator() to make the type known.  The specified base
 // path is used to prefix all keys in the kvstore. The provided path must be
 // unique.
@@ -201,7 +263,7 @@ func NewAllocatorForGC(backend *kvstoreallocator.KVStoreBackend) *Allocator {
 //
 // After creation, IDs can be allocated with Allocate() and released with
 // Release()
-func NewAllocator(typ kvstoreallocator.AllocatorKey, backend *kvstoreallocator.KVStoreBackend, opts ...AllocatorOption) (*Allocator, error) {
+func NewAllocator(typ AllocatorKey, backend Backend, opts ...AllocatorOption) (*Allocator, error) {
 	a := &Allocator{
 		keyType:      typ,
 		backend:      backend,
@@ -221,10 +283,7 @@ func NewAllocator(typ kvstoreallocator.AllocatorKey, backend *kvstoreallocator.K
 		fn(a)
 	}
 
-	a.mainCache = newCache(kvstore.Client(), a.backend.IDPrefix)
-
-	// invalid prefixes are only deleted from the main cache
-	a.mainCache.deleteInvalidPrefixes = true
+	a.mainCache = newCache(a)
 
 	if a.suffix == "<nil>" {
 		return nil, errors.New("allocator suffix is <nil> and unlikely unique")
@@ -257,7 +316,7 @@ func NewAllocator(typ kvstoreallocator.AllocatorKey, backend *kvstoreallocator.K
 
 // WithBackend sets this allocator to use backend. It is expected to be used at
 // initialization.
-func WithBackend(backend *kvstoreallocator.KVStoreBackend) AllocatorOption {
+func WithBackend(backend Backend) AllocatorOption {
 	return func(a *Allocator) {
 		a.backend = backend
 	}
@@ -324,7 +383,7 @@ func (a *Allocator) WaitForInitialSync(ctx context.Context) error {
 }
 
 // RangeFunc is the function called by RangeCache
-type RangeFunc func(idpool.ID, kvstoreallocator.AllocatorKey)
+type RangeFunc func(idpool.ID, AllocatorKey)
 
 // ForeachCache iterates over the allocator cache and calls RangeFunc on each
 // cached entry
@@ -351,11 +410,33 @@ func (a *Allocator) selectAvailableID() (idpool.ID, string, idpool.ID) {
 	return 0, "", 0
 }
 
-func (a *Allocator) lockedAllocate(ctx context.Context, key kvstoreallocator.AllocatorKey) (idpool.ID, bool, error) {
+// AllocatorKey is the interface to implement in order for a type to be used as
+// key for the allocator. The key's data is assumed to be a collection of
+// pkg/label.Label, and the functions reflect this somewhat.
+type AllocatorKey interface {
+	fmt.Stringer
+
+	// GetKey returns the canonical string representation of the key
+	GetKey() string
+
+	// PutKey stores the information in v into the key. This is is the inverse
+	// operation to GetKey
+	PutKey(v string) (AllocatorKey, error)
+
+	// GetAsMap returns the key as a collection of "labels" with a key and value.
+	// This is the inverse operation to PutKeyFromMap.
+	GetAsMap() map[string]string
+
+	// PutKeyFromMap stores the labels in v into the key to be used later. This
+	// is the inverse operation to GetAsMap.
+	PutKeyFromMap(v map[string]string) AllocatorKey
+}
+
+func (a *Allocator) lockedAllocate(ctx context.Context, key AllocatorKey) (idpool.ID, bool, error) {
 	kvstore.Trace("Allocating key in kvstore", nil, logrus.Fields{fieldKey: key})
 
 	k := key.GetKey()
-	lock, err := a.backend.LockPath(ctx, k)
+	lock, err := a.backend.Lock(ctx, key)
 	if err != nil {
 		return 0, false, err
 	}
@@ -364,7 +445,7 @@ func (a *Allocator) lockedAllocate(ctx context.Context, key kvstoreallocator.All
 
 	// fetch first key that matches /value/<key> while ignoring the
 	// node suffix
-	value, err := a.backend.GetIfLocked(ctx, key, lock)
+	value, err := a.Get(ctx, key)
 	if err != nil {
 		return 0, false, err
 	}
@@ -381,42 +462,47 @@ func (a *Allocator) lockedAllocate(ctx context.Context, key kvstoreallocator.All
 		value = a.localKeys.lookupKey(k)
 		if value != 0 {
 			// re-create master key
-			keyPath := path.Join(a.backend.IDPrefix, strconv.FormatUint(uint64(value), 10))
-			success, err := a.backend.CreateOnlyIfLocked(ctx, keyPath, []byte(k), false, lock)
-			if err != nil || !success {
-				return 0, false, fmt.Errorf("unable to create master key '%s': %s", keyPath, err)
+			if err := a.backend.UpdateKey(ctx, value, key, true); err != nil {
+				return 0, false, fmt.Errorf("unable to re-create missing master key '%s': %s while allocating ID: %s", key, value, err)
 			}
 		}
 	} else {
-		_, err := a.localKeys.allocate(k, value)
+		_, err := a.localKeys.allocate(key, value)
 		if err != nil {
 			return 0, false, fmt.Errorf("unable to reserve local key '%s': %s", k, err)
 		}
 	}
+
 	if value != 0 {
-		if err = a.backend.CreateValueNodeKey(ctx, k, value, lock); err != nil {
+		log.WithField(fieldKey, k).Info("Reusing existing global key")
+
+		if err = a.backend.AcquireReference(ctx, value, key, lock); err != nil {
 			a.localKeys.release(k)
 			return 0, false, fmt.Errorf("unable to create slave key '%s': %s", k, err)
 		}
 
-		log.WithField(fieldKey, k).Info("Reusing existing global key")
+		// mark the key as verified in the local cache
+		if err := a.localKeys.verify(k); err != nil {
+			log.WithError(err).Error("BUG: Unable to verify local key")
+		}
 
 		return value, false, nil
 	}
 
+	log.WithField(fieldKey, k).Debug("Allocating new master ID")
 	id, strID, unmaskedID := a.selectAvailableID()
 	if id == 0 {
 		return 0, false, fmt.Errorf("no more available IDs in configured space")
 	}
 
-	kvstore.Trace("Selected available key", nil, logrus.Fields{fieldID: id})
+	kvstore.Trace("Selected available key ID", nil, logrus.Fields{fieldID: id})
 
 	releaseKeyAndID := func() {
 		a.localKeys.release(k)
-		a.idPool.Release(unmaskedID)
+		a.idPool.Release(unmaskedID) // This returns this ID to be re-used for other keys
 	}
 
-	oldID, err := a.localKeys.allocate(k, id)
+	oldID, err := a.localKeys.allocate(key, id)
 	if err != nil {
 		a.idPool.Release(unmaskedID)
 		return 0, false, fmt.Errorf("unable to reserve local key '%s': %s", k, err)
@@ -426,23 +512,33 @@ func (a *Allocator) lockedAllocate(ctx context.Context, key kvstoreallocator.All
 	// start over
 	if id != oldID {
 		releaseKeyAndID()
-		return 0, false, fmt.Errorf("another writer has allocated this key")
+		return 0, false, fmt.Errorf("another writer has allocated key %s", k)
 	}
 
-	// create /id/<ID> and fail if it already exists
-	keyPath := path.Join(a.backend.IDPrefix, strID)
-	success, err := a.backend.CreateOnlyIfLocked(ctx, keyPath, []byte(k), false, lock)
-	if err != nil || !success {
-		// Creation failed. Another agent most likely beat us to allocating this
+	// Check that this key has not been allocated in the cluster during our
+	// operation here
+	value, err = a.GetNoCache(ctx, key)
+	if err != nil {
+		releaseKeyAndID()
+		return 0, false, err
+	}
+	if value != 0 {
+		releaseKeyAndID()
+		return 0, false, fmt.Errorf("Found master key after proceeding with new allocation for %s", k)
+	}
+
+	err = a.backend.AllocateID(ctx, id, key)
+	if err != nil {
+		// Creation failed. Another agent most likely beat us to allocting this
 		// ID, retry.
 		releaseKeyAndID()
-		return 0, false, fmt.Errorf("unable to create master key '%s': %s", keyPath, err)
+		return 0, false, fmt.Errorf("unable to allocate ID %s for key %s: %s", strID, key, err)
 	}
 
 	// Notify pool that leased ID is now in-use.
 	a.idPool.Use(unmaskedID)
 
-	if err = a.backend.CreateValueNodeKey(ctx, k, id, lock); err != nil {
+	if err = a.backend.AcquireReference(ctx, id, key, lock); err != nil {
 		// We will leak the master key here as the key has already been
 		// exposed and may be in use by other nodes. The garbage
 		// collector will release it again.
@@ -462,7 +558,7 @@ func (a *Allocator) lockedAllocate(ctx context.Context, key kvstoreallocator.All
 //
 // Returns the ID allocated to the key, if the ID had to be allocated, then
 // true is returned. An error is returned in case of failure.
-func (a *Allocator) Allocate(ctx context.Context, key kvstoreallocator.AllocatorKey) (idpool.ID, bool, error) {
+func (a *Allocator) Allocate(ctx context.Context, key AllocatorKey) (idpool.ID, bool, error) {
 	var (
 		err   error
 		value idpool.ID
@@ -528,7 +624,7 @@ func (a *Allocator) Allocate(ctx context.Context, key kvstoreallocator.Allocator
 // GetIfLocked returns the ID which is allocated to a key. Returns an ID of NoID if no ID
 // has been allocated to this key yet if the client is still holding the given
 // lock.
-func (a *Allocator) GetIfLocked(ctx context.Context, key kvstoreallocator.AllocatorKey, lock kvstore.KVLocker) (idpool.ID, error) {
+func (a *Allocator) GetIfLocked(ctx context.Context, key AllocatorKey, lock kvstore.KVLocker) (idpool.ID, error) {
 	if id := a.mainCache.get(key.GetKey()); id != idpool.NoID {
 		return id, nil
 	}
@@ -538,7 +634,7 @@ func (a *Allocator) GetIfLocked(ctx context.Context, key kvstoreallocator.Alloca
 
 // Get returns the ID which is allocated to a key. Returns an ID of NoID if no ID
 // has been allocated to this key yet.
-func (a *Allocator) Get(ctx context.Context, key kvstoreallocator.AllocatorKey) (idpool.ID, error) {
+func (a *Allocator) Get(ctx context.Context, key AllocatorKey) (idpool.ID, error) {
 	if id := a.mainCache.get(key.GetKey()); id != idpool.NoID {
 		return id, nil
 	}
@@ -548,13 +644,13 @@ func (a *Allocator) Get(ctx context.Context, key kvstoreallocator.AllocatorKey) 
 
 // GetNoCache returns the ID which is allocated to a key in the kvstore,
 // bypassing the local copy of allocated keys.
-func (a *Allocator) GetNoCache(ctx context.Context, key kvstoreallocator.AllocatorKey) (idpool.ID, error) {
+func (a *Allocator) GetNoCache(ctx context.Context, key AllocatorKey) (idpool.ID, error) {
 	return a.backend.Get(ctx, key)
 }
 
 // GetByID returns the key associated with an ID. Returns nil if no key is
 // associated with the ID.
-func (a *Allocator) GetByID(id idpool.ID) (kvstoreallocator.AllocatorKey, error) {
+func (a *Allocator) GetByID(id idpool.ID) (AllocatorKey, error) {
 	if key := a.mainCache.getByID(id); key != nil {
 		return key, nil
 	}
@@ -565,7 +661,7 @@ func (a *Allocator) GetByID(id idpool.ID) (kvstoreallocator.AllocatorKey, error)
 // Release releases the use of an ID associated with the provided key. After
 // the last user has released the ID, the key is removed in the KVstore and
 // the returned lastUse value is true.
-func (a *Allocator) Release(ctx context.Context, key kvstoreallocator.AllocatorKey) (lastUse bool, err error) {
+func (a *Allocator) Release(ctx context.Context, key AllocatorKey) (lastUse bool, err error) {
 	log.WithField(fieldKey, key).Info("Releasing key")
 
 	select {
@@ -597,7 +693,6 @@ func (a *Allocator) RunGC(staleKeysPrevRound map[string]uint64) (map[string]uint
 	return a.backend.RunGC(staleKeysPrevRound)
 }
 
-// DeleteAllKeys will delete all keys
 func (a *Allocator) DeleteAllKeys() {
 	a.backend.DeleteAllKeys()
 }
@@ -605,7 +700,7 @@ func (a *Allocator) DeleteAllKeys() {
 // syncLocalKeys checks the kvstore and verifies that a master key exists for
 // all locally used allocations. This will restore master keys if deleted for
 // some reason.
-func (a *Allocator) syncLocalKeys() error {
+func (a *Allocator) syncLocalKeys(ctx context.Context) error {
 	// Create a local copy of all local allocations to not require to hold
 	// any locks while performing kvstore operations. Local use can
 	// disappear while we perform the sync but that is fine as worst case,
@@ -614,7 +709,9 @@ func (a *Allocator) syncLocalKeys() error {
 	ids := a.localKeys.getVerifiedIDs()
 
 	for id, value := range ids {
-		a.backend.RecreateMasterKey(id, value, false)
+		if err := a.backend.UpdateKey(ctx, id, value, false); err != nil {
+			return fmt.Errorf("unable to sync key \"%s\"->\"%s\": %s", id, value, err)
+		}
 	}
 
 	return nil
@@ -623,7 +720,7 @@ func (a *Allocator) syncLocalKeys() error {
 func (a *Allocator) startLocalKeySync() {
 	go func(a *Allocator) {
 		for {
-			if err := a.syncLocalKeys(); err != nil {
+			if err := a.syncLocalKeys(context.TODO()); err != nil {
 				log.WithError(err).Warning("Unable to run local key sync routine")
 			}
 
@@ -649,7 +746,7 @@ type AllocatorEvent struct {
 	ID idpool.ID
 
 	// Key is the key associated with the ID
-	Key kvstoreallocator.AllocatorKey
+	Key AllocatorKey
 }
 
 // RemoteCache represents the cache content of an additional kvstore managing
@@ -667,7 +764,7 @@ type RemoteCache struct {
 // function.
 func (a *Allocator) WatchRemoteKVStore(backend kvstore.BackendOperations, prefix string) *RemoteCache {
 	rc := &RemoteCache{
-		cache:     newCache(backend, path.Join(prefix, "id")),
+		cache:     newCache(a),
 		allocator: a,
 	}
 

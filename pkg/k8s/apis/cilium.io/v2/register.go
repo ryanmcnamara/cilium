@@ -105,6 +105,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&CiliumEndpoint{},
 		&CiliumNode{},
 		&CiliumNodeList{},
+		&CiliumIdentity{},
+		&CiliumIdentityList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil
@@ -122,6 +124,10 @@ func CreateCustomResourceDefinitions(clientset apiextensionsclient.Interface) er
 	}
 
 	if err := createNodeCRD(clientset); err != nil {
+		return err
+	}
+
+	if err := createIdentityCRD(clientset); err != nil {
 		return err
 	}
 
@@ -285,6 +291,32 @@ func createNodeCRD(clientset apiextensionsclient.Interface) error {
 	}
 
 	return createUpdateCRD(clientset, "v2.CiliumNode", res)
+}
+
+// createIdentityCRD creates and updates the CiliumIdentity CRD. It should be
+// called on agent startup but is idempotent and safe to call again.
+func createIdentityCRD(clientset apiextensionsclient.Interface) error {
+	res := &apiextensionsv1beta1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ciliumidentities." + SchemeGroupVersion.Group,
+		},
+		Spec: apiextensionsv1beta1.CustomResourceDefinitionSpec{
+			Group:   SchemeGroupVersion.Group,
+			Version: SchemeGroupVersion.Version,
+			Names: apiextensionsv1beta1.CustomResourceDefinitionNames{
+				Plural:     "ciliumidentities",
+				Singular:   "ciliumidentity",
+				ShortNames: []string{"ciliumid", "identity"},
+				Kind:       "CiliumIdentity",
+			},
+			Subresources: &apiextensionsv1beta1.CustomResourceSubresources{
+				Status: &apiextensionsv1beta1.CustomResourceSubresourceStatus{},
+			},
+			Scope: apiextensionsv1beta1.ClusterScoped,
+		},
+	}
+
+	return createUpdateCRD(clientset, "v2.CiliumIdentity", res)
 }
 
 // createUpdateCRD ensures the CRD object is installed into the k8s cluster. It
